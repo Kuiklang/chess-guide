@@ -59,6 +59,11 @@ export async function analyseGame(
     const moverAfter = negate(after.score);
     const isBest = before.bestmove === moves[i];
     const drop = isBest ? 0 : Math.max(0, winPercent(moverBefore) - winPercent(moverAfter));
+    let grade = gradeFromDrop(drop, isBest);
+    // Allowing a forced mate, or missing one, matters even when the position was already decided.
+    const lostBefore = moverBefore.type === 'mate' && moverBefore.value < 0;
+    if (!isBest && moverAfter.type === 'mate' && moverAfter.value < 0 && !lostBefore) grade = 'blunder';
+    else if (!isBest && moverBefore.type === 'mate' && moverBefore.value > 0 && !(moverAfter.type === 'mate' && moverAfter.value > 0) && grade !== 'blunder') grade = 'mistake';
     const accuracy = moveAccuracy(drop);
     acc[mover].push(accuracy);
     plies.push({
@@ -66,7 +71,7 @@ export async function analyseGame(
       bestUci: before.bestmove,
       bestPv: before.pv,
       bestScore: before.score,
-      grade: gradeFromDrop(drop, isBest),
+      grade,
       accuracy,
       drop,
     });

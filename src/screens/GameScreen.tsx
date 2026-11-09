@@ -13,10 +13,12 @@ import {
   toWhite,
   tryMove,
 } from '../lib/chessUtil';
-import { describeOpponentMove, explainMove, intentPhrase, type Explanation } from '../lib/explain';
+import { describeOpponentMove, intentPhrase } from '../lib/explain';
+import { deepExplain, opponentPurpose, planForLine, strategicNotes, type DeepExplanation } from '../lib/insight';
+import { identifyOpening, loadOpenings, openingTitle, type OpeningInfo } from '../lib/openings';
 import { BOT_LEVELS, type GameConfig } from '../lib/gameConfig';
 import { MODE_NAME, newGameId, saveGame } from '../lib/storage';
-import ExplanationCard from '../components/ExplanationCard';
+import DeepCard, { Collapsible, Sections } from '../components/DeepCard';
 import MoveList from '../components/MoveList';
 
 interface Ply {
@@ -38,21 +40,24 @@ interface Props {
   onRestart: () => void;
 }
 
-const SUGGEST_OPTS = { multipv: 3, depth: 14, movetime: 2500 };
-const AFTER_OPTS = { multipv: 1, depth: 12, movetime: 1200 };
+const SUGGEST_OPTS = { multipv: 3, depth: 15, movetime: 3000 };
+const AFTER_OPTS = { multipv: 1, depth: 13, movetime: 1500 };
 
 export default function GameScreen({ config, onExit, onAnalyse, onRestart }: Props) {
   const { mode, playerColor } = config;
+  // Guide mode, and bot mode with teaching switched on, both coach the user.
+  const teaching = mode === 'guide' || (mode === 'bot' && !!config.teach);
   const [plies, setPlies] = useState<Ply[]>([]);
   const [ending, setEnding] = useState<Ending | null>(null);
   const [showResult, setShowResult] = useState(false);
   const [showEndMenu, setShowEndMenu] = useState(false);
   const [orientation, setOrientation] = useState<'w' | 'b'>(mode === 'pvp' ? 'w' : playerColor);
   const [lines, setLines] = useState<{ fen: string; lines: PvLine[] } | null>(null);
-  const [explanations, setExplanations] = useState<Record<string, Explanation>>({});
+  const [explanations, setExplanations] = useState<Record<string, DeepExplanation>>({});
   const [hintFen, setHintFen] = useState<string | null>(null);
   const [botThinking, setBotThinking] = useState(false);
   const [engineError, setEngineError] = useState(false);
+  const [openingDb, setOpeningDb] = useState<Awaited<ReturnType<typeof loadOpenings>> | null>(null);
   const gameId = useRef(newGameId());
   const cache = useRef(new Map<string, Promise<PvLine[]>>());
   const mounted = useRef(true);
@@ -66,10 +71,12 @@ export default function GameScreen({ config, onExit, onAnalyse, onRestart }: Pro
   useEffect(() => {
     mounted.current = true;
     engine.warmUp();
+    if (teaching) loadOpenings().then((db) => mounted.current && setOpeningDb(db));
     return () => {
       mounted.current = false;
       engine.cancelAll();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   /** Engine lines for a position, shared between callers and cached. */
@@ -102,12 +109,13 @@ export default function GameScreen({ config, onExit, onAnalyse, onRestart }: Pro
         mode,
         playerColor: mode === 'pvp' ? undefined : playerColor,
         botLevel: mode === 'bot' ? config.botLevel : undefined,
+        teach: mode === 'bot' ? !!config.teach : undefined,
         moves: allPlies.map((p) => p.uci),
         result: end.result,
         resultText: end.text,
       });
     },
-    [mode, playerColor, config.botLevel],
+    [mode, playerColor, config.botLevel, config.teach],
   );
 
   const playMove = useCallback(
@@ -132,11 +140,13 @@ export default function GameScreen({ config, onExit, onAnalyse, onRestart }: Pro
     let active = true;
     setBotThinking(true);
     const started = Date.now();
+    // In teaching mode give the user a moment to read before the bot answers.
+    const minDelay = teaching ? 900 : 500;
     engine
       .search(fen, { skill: level.skill, depth: level.depth, movetime: level.movetime, multipv: 1 })
       .then((res) => {
         if (!active || !res.bestmove) return;
-        const wait = Math.max(0, 500 - (Date.now() - started));
+        const wait = Math.max(0, minDelay - (Date.now() - started));
         setTimeout(() => {
           if (active && mounted.current) playMove(res.bestmove!);
         }, wait);
@@ -151,9 +161,9 @@ export default function GameScreen({ config, onExit, onAnalyse, onRestart }: Pro
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fen, mode, ending]);
 
-  // ---- Guide: suggestions on the user's turn ----
+  // ---- Teaching: suggestions on the user's turn ----
   useEffect(() => {
-    if (mode !== 'guide' || ending || turn !== playerColor) return;
+    if (!teaching || ending || turn !== playerColor) return;
     let active = true;
     getLines(fen, SUGGEST_OPTS)
       .then((l) => active && mounted.current && setLines({ fen, lines: l }))
@@ -162,25 +172,32 @@ export default function GameScreen({ config, onExit, onAnalyse, onRestart }: Pro
       active = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fen, mode, ending]);
+  }, [fen, teaching, ending]);
 
-  // ---- Guide: explain the user's move once it is played ----
+  // ---- Teaching: explain the user's move once it is played ----
   useEffect(() => {
-    if (mode !== 'guide' || !lastPly) return;
+    if (!teaching || !lastPly) return;
     const moverColor = new Chess(lastPly.fenBefore).turn();
     if (moverColor !== playerColor) return;
     const key = lastPly.fenBefore + lastPly.uci;
     if (explanations[key]) return;
     const ply = lastPly;
+    const prevPly = plies.length >= 2 ? plies[plies.length - 2] : undefined;
     (async () => {
       const bestLines = await getLines(ply.fenBefore, SUGGEST_OPTS);
       const afterGame = new Chess(ply.fenAfter);
       const afterLines = afterGame.isGameOver() ? [] : await getLines(ply.fenAfter, AFTER_OPTS);
-      const exp = explainMove({ fen: ply.fenBefore, played: ply.uci, bestLines, afterLine: afterLines[0] });
+      const exp = deepExplain({
+        fen: ply.fenBefore,
+        played: ply.uci,
+        bestLines,
+        afterLine: afterLines[0],
+        prev: prevPly ? { fen: prevPly.fenBefore, uci: prevPly.uci } : undefined,
+      });
       if (exp && mounted.current) setExplanations((prev) => ({ ...prev, [key]: exp }));
     })().catch(handleEngineError);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [lastPly, mode]);
+  }, [lastPly, teaching]);
 
   // ---- Bot mode hint ----
   useEffect(() => {
@@ -227,6 +244,7 @@ export default function GameScreen({ config, onExit, onAnalyse, onRestart }: Pro
         mode,
         playerColor: mode === 'pvp' ? undefined : playerColor,
         botLevel: mode === 'bot' ? config.botLevel : undefined,
+        teach: mode === 'bot' ? !!config.teach : undefined,
         moves: plies.map((p) => p.uci),
         result: '*',
         resultText: 'ยังเล่นไม่จบ',
@@ -243,8 +261,8 @@ export default function GameScreen({ config, onExit, onAnalyse, onRestart }: Pro
   const currentLines = lines && lines.fen === fen ? lines.lines : null;
 
   const arrows: Arrow[] = [];
-  const showSuggestions = mode === 'guide' && !ending && turn === playerColor;
-  const showHint = mode === 'bot' && hintFen === fen && !ending;
+  const showSuggestions = teaching && !ending && turn === playerColor;
+  const showHint = mode === 'bot' && !teaching && hintFen === fen && !ending;
   if ((showSuggestions || showHint) && currentLines) {
     const shown = showHint ? currentLines.slice(0, 1) : currentLines;
     shown.forEach((l, i) => {
@@ -262,27 +280,29 @@ export default function GameScreen({ config, onExit, onAnalyse, onRestart }: Pro
 
   // ---- Side panel content ----
   const playerName = COLOR_NAME[playerColor];
+  const opponentName = mode === 'bot' ? 'บอท' : 'ฝ่ายตรงข้าม';
   let status: string;
   if (ending) status = ending.text;
   else if (mode === 'pvp') status = `ตา${COLOR_NAME[turn]}เดิน`;
   else if (mode === 'bot') status = turn === playerColor ? `ตาของคุณ (${playerName})` : 'บอทกำลังคิด...';
   else status = turn === playerColor ? `ตาของคุณ (${playerName})` : `เดินหมากของฝ่ายตรงข้ามตามกระดานจริง`;
 
-  const userExplanation =
-    mode === 'guide' && lastPly && new Chess(lastPly.fenBefore).turn() === playerColor
-      ? explanations[lastPly.fenBefore + lastPly.uci]
-      : undefined;
-  const awaitingExplanation =
-    mode === 'guide' && lastPly && new Chess(lastPly.fenBefore).turn() === playerColor && !userExplanation;
+  const userJustMoved = teaching && lastPly && new Chess(lastPly.fenBefore).turn() === playerColor;
+  const userExplanation = userJustMoved ? explanations[lastPly.fenBefore + lastPly.uci] : undefined;
+  const awaitingExplanation = userJustMoved && !userExplanation;
 
   const opponentWarnings =
-    mode === 'guide' && lastPly && turn === playerColor
-      ? describeOpponentMove(lastPly.fenBefore, lastPly.uci, currentLines?.[0])
-      : [];
+    teaching && lastPly && turn === playerColor ? describeOpponentMove(lastPly.fenBefore, lastPly.uci, currentLines?.[0]) : [];
 
-  // Explanation of the user's previous move stays visible (collapsed) on their next turn.
-  const prevUserPly = mode === 'guide' && turn === playerColor && plies.length >= 2 ? plies[plies.length - 2] : undefined;
+  // Explanation of the user's previous move stays visible on their next turn.
+  const prevUserPly = teaching && turn === playerColor && plies.length >= 2 ? plies[plies.length - 2] : undefined;
   const prevExplanation = prevUserPly ? explanations[prevUserPly.fenBefore + prevUserPly.uci] : undefined;
+
+  const opening: OpeningInfo | null = useMemo(
+    () => (openingDb && plies.length ? identifyOpening(openingDb, plies.map((p) => p.uci)) : null),
+    [openingDb, plies],
+  );
+  const notes = useMemo(() => (teaching && !ending && turn === playerColor ? strategicNotes(fen, playerColor) : []), [teaching, ending, turn, playerColor, fen]);
 
   return (
     <div className="game-screen">
@@ -292,7 +312,13 @@ export default function GameScreen({ config, onExit, onAnalyse, onRestart }: Pro
         </button>
         <div className="topbar-title">
           {MODE_NAME[mode]}
-          {mode === 'bot' && <span className="sub"> · ระดับ{BOT_LEVELS[config.botLevel - 1]?.name}</span>}
+          {mode === 'bot' && (
+            <span className="sub">
+              {' '}
+              · ระดับ{BOT_LEVELS[config.botLevel - 1]?.name}
+              {config.teach ? ' · โหมดสอน' : ''}
+            </span>
+          )}
         </div>
         <button className="icon-btn" onClick={() => setOrientation((o) => (o === 'w' ? 'b' : 'w'))} aria-label="หมุนกระดาน">
           ⟲
@@ -306,7 +332,7 @@ export default function GameScreen({ config, onExit, onAnalyse, onRestart }: Pro
             <button onClick={undo} disabled={plies.length === 0}>
               ↶ ย้อนกลับ
             </button>
-            {mode === 'bot' && !ending && (
+            {mode === 'bot' && !teaching && !ending && (
               <button onClick={() => setHintFen(fen)} disabled={turn !== playerColor || botThinking}>
                 💡 ขอคำใบ้
               </button>
@@ -329,36 +355,43 @@ export default function GameScreen({ config, onExit, onAnalyse, onRestart }: Pro
 
           {engineError && <div className="card warn">โหลดตัวคิด (Stockfish) ไม่สำเร็จ ลองรีเฟรชหน้าเว็บ</div>}
 
-          {mode === 'guide' && !ending && (
+          {teaching && !ending && (
             <>
-              {userExplanation && <ExplanationCard title="คำอธิบายตาที่คุณเดิน" exp={userExplanation} />}
+              {userExplanation && <DeepCard title="คำอธิบายตาที่คุณเดิน" exp={userExplanation} />}
               {awaitingExplanation && <div className="card muted">กำลังวิเคราะห์ตาที่คุณเดิน...</div>}
 
               {turn === playerColor && (
                 <>
                   {lastPly && (
                     <div className="card">
-                      <div className="card-title">ฝ่ายตรงข้ามเดิน: {describeMoveFromTo(tryMove(lastPly.fenBefore, lastPly.uci)!.move)}</div>
-                      {opponentWarnings.length > 0 ? (
+                      <div className="card-title">
+                        {opponentName}เดิน: {describeMoveFromTo(tryMove(lastPly.fenBefore, lastPly.uci)!.move)}
+                      </div>
+                      <div className="summary-text">{opponentPurpose(lastPly.fenBefore, lastPly.uci, prevUserPly ? tryMove(prevUserPly.fenBefore, prevUserPly.uci)?.move : undefined)}</div>
+                      {opponentWarnings.length > 0 && (
                         <ul className="reasons warn-list">
                           {opponentWarnings.map((w, i) => (
                             <li key={i}>{w}</li>
                           ))}
                         </ul>
-                      ) : (
-                        <div className="muted small">ไม่มีภัยคุกคามที่ชัดเจน</div>
                       )}
                     </div>
                   )}
                   <Suggestions fen={fen} lines={currentLines} onPick={playMove} />
-                  {prevExplanation && (
-                    <details className="card collapsed">
-                      <summary>คำอธิบายตาก่อนหน้าของคุณ</summary>
-                      <ExplanationCard exp={prevExplanation} bare />
-                    </details>
+                  {prevExplanation && <DeepCard title="ตาที่แล้วของคุณ" exp={prevExplanation} />}
+                  {notes.length > 0 && (
+                    <Collapsible title="🧠 กลยุทธ์ตอนนี้" preview={notes[0]}>
+                      <ul className="reasons">
+                        {notes.slice(1).map((n, i) => (
+                          <li key={i}>{n}</li>
+                        ))}
+                      </ul>
+                      {notes.length === 1 && <div className="muted small">ไม่มีประเด็นอื่นเพิ่มเติม</div>}
+                    </Collapsible>
                   )}
                 </>
               )}
+              {opening && <OpeningCard opening={opening} playerColor={playerColor} />}
             </>
           )}
 
@@ -415,7 +448,7 @@ export default function GameScreen({ config, onExit, onAnalyse, onRestart }: Pro
             <h3>เกมจบแล้ว</h3>
             <p className="result-text">{ending.text}</p>
             <button className="primary" onClick={() => onAnalyse(gameId.current)}>
-              📊 วิเคราะห์เกม
+              📊 วิเคราะห์และสรุปเกม
             </button>
             <button onClick={onRestart}>เล่นใหม่</button>
             <button onClick={onExit}>กลับหน้าหลัก</button>
@@ -429,7 +462,29 @@ export default function GameScreen({ config, onExit, onAnalyse, onRestart }: Pro
   );
 }
 
+function OpeningCard({ opening, playerColor }: { opening: OpeningInfo; playerColor: 'w' | 'b' }) {
+  const g = opening.guide;
+  return (
+    <Collapsible title={`📖 การเปิดหมาก: ${openingTitle(opening)}`} preview={g?.idea}>
+      {g ? (
+        <>
+          <p>
+            <b>แผนของคุณ ({playerColor === 'w' ? 'ขาว' : 'ดำ'}):</b> {playerColor === 'w' ? g.white : g.black}
+          </p>
+          <p>
+            <b>ฝ่ายตรงข้ามจะพยายาม:</b> {playerColor === 'w' ? g.black : g.white}
+          </p>
+        </>
+      ) : (
+        <p className="muted">ยังไม่มีคำอธิบายภาษาไทยสำหรับการเปิดหมากแบบนี้ ใช้หลักพื้นฐาน: ยึดกลางกระดาน พัฒนาหมากเล็ก และเข้าป้อม</p>
+      )}
+      <p className="muted small">รหัส ECO {opening.eco}</p>
+    </Collapsible>
+  );
+}
+
 function Suggestions({ fen, lines, onPick }: { fen: string; lines: PvLine[] | null; onPick: (uci: string) => void }) {
+  const [openPlan, setOpenPlan] = useState<string | null>(null);
   if (!lines) return <div className="card muted">กำลังหาตาเดินที่ดีที่สุด...</div>;
   if (lines.length === 0) return null;
   const turn = new Chess(fen).turn();
@@ -440,6 +495,7 @@ function Suggestions({ fen, lines, onPick }: { fen: string; lines: PvLine[] | nu
         {lines.map((l, i) => {
           const m = tryMove(fen, l.pv[0]);
           if (!m) return null;
+          const planOpen = openPlan === l.pv[0];
           return (
             <li key={l.pv[0]} className={i === 0 ? 'best' : ''} onClick={() => onPick(l.pv[0])}>
               <span className={'num n' + (i + 1)}>{i === 0 ? '⭐' : i + 1}</span>
@@ -449,6 +505,20 @@ function Suggestions({ fen, lines, onPick }: { fen: string; lines: PvLine[] | nu
                   {i === 0 && <span className="tag">ดีที่สุด</span>}
                 </div>
                 <div className="suggest-why">เพื่อ{intentPhrase(fen, l)}</div>
+                <button
+                  className="plan-btn"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setOpenPlan(planOpen ? null : l.pv[0]);
+                  }}
+                >
+                  {planOpen ? 'ซ่อนแผน ▴' : 'ดูแผนต่อจากนี้ ▾'}
+                </button>
+                {planOpen && (
+                  <div className="plan" onClick={(e) => e.stopPropagation()}>
+                    <Sections sections={planForLine(fen, l)} />
+                  </div>
+                )}
               </div>
               <span className="score">{formatScore(toWhite(l.score, turn))}</span>
             </li>

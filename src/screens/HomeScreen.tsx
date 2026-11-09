@@ -11,7 +11,7 @@ interface Props {
 type ColorChoice = 'w' | 'b' | 'random';
 
 const MODES: { mode: Mode; icon: string; title: string; desc: string }[] = [
-  { mode: 'bot', icon: '🤖', title: 'เล่นกับบอท', desc: 'ฝึกเล่นกับคอมพิวเตอร์ 5 ระดับ มีปุ่มขอคำใบ้' },
+  { mode: 'bot', icon: '🤖', title: 'เล่นกับบอท', desc: 'ฝึกเล่นกับคอมพิวเตอร์ 5 ระดับ เปิดโหมดสอนเพื่อรับคำแนะนำและคำอธิบายกลยุทธ์ระหว่างเล่น' },
   { mode: 'pvp', icon: '👥', title: 'เล่น 2 คน', desc: 'ผลัดกันเดินบนเครื่องเดียว' },
   {
     mode: 'guide',
@@ -25,11 +25,12 @@ export default function HomeScreen({ onStart, onHistory, savedCount }: Props) {
   const [mode, setMode] = useState<Mode | null>(null);
   const [color, setColor] = useState<ColorChoice>('w');
   const [level, setLevel] = useState(3);
+  const [teach, setTeach] = useState(true);
 
   const start = () => {
     if (!mode) return;
     const playerColor = color === 'random' ? (Math.random() < 0.5 ? 'w' : 'b') : color;
-    onStart({ mode, playerColor, botLevel: level });
+    onStart({ mode, playerColor, botLevel: level, teach: mode === 'bot' && teach });
   };
 
   return (
@@ -87,6 +88,13 @@ export default function HomeScreen({ onStart, onHistory, savedCount }: Props) {
                   </button>
                 ))}
               </div>
+              <label className="toggle-row">
+                <input type="checkbox" checked={teach} onChange={(e) => setTeach(e.target.checked)} />
+                <span>
+                  <b>โหมดสอน</b>
+                  <span className="muted small"> แนะนำ 3 ทางเลือกทุกตา อธิบายตาที่คุณเดินและตาของบอท พร้อมกลยุทธ์</span>
+                </span>
+              </label>
             </>
           )}
         </div>

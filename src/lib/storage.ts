@@ -32,6 +32,7 @@ export interface SavedGame {
   /** The user's side in bot/guide mode. */
   playerColor?: 'w' | 'b';
   botLevel?: number;
+  teach?: boolean;
   /** UCI moves from the start position. */
   moves: string[];
   /** PGN result token. */

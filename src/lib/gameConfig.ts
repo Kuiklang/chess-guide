@@ -7,6 +7,8 @@ export interface GameConfig {
   /** User's side in bot and guide mode. White in 2-player mode. */
   playerColor: 'w' | 'b';
   botLevel: number;
+  /** Bot mode only: show suggestions and explanations while playing. */
+  teach?: boolean;
 }
 
 export interface BotLevel {

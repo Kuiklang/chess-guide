@@ -3,26 +3,33 @@ import { Chess, DEFAULT_POSITION, type Square } from 'chess.js';
 import Board, { type Arrow } from '../components/Board';
 import EvalGraph from '../components/EvalGraph';
 import MoveList from '../components/MoveList';
-import ExplanationCard from '../components/ExplanationCard';
+import DeepCard, { Sections } from '../components/DeepCard';
 import { analyseGame } from '../lib/analysis';
 import { engine, isCancelled, type PvLine, type Score } from '../lib/engine';
-import { describeAdvantage, formatScore, parseUci } from '../lib/chessUtil';
-import { GRADE_ICON, GRADE_LABEL, explainMove, pvText, type Grade } from '../lib/explain';
+import { describeAdvantage, describeMoveFromTo, formatScore, parseUci, tryMove } from '../lib/chessUtil';
+import { GRADE_ICON, GRADE_LABEL, pvText, type Grade } from '../lib/explain';
+import { deepExplain, moveReason, type DeepExplanation } from '../lib/insight';
+import { identifyOpening, loadOpenings, type OpeningInfo } from '../lib/openings';
+import { summarizeGame } from '../lib/summary';
 import { buildPgn } from '../lib/gameConfig';
-import { MODE_NAME, getGame, saveGame, type SavedGame } from '../lib/storage';
+import { MODE_NAME, getGame, saveGame, type GameAnalysis, type SavedGame } from '../lib/storage';
 
 interface Props {
   gameId: string;
   onBack: () => void;
 }
 
+type Tab = 'summary' | 'moves' | 'read';
+
 export default function AnalysisScreen({ gameId, onBack }: Props) {
   const [game, setGame] = useState<SavedGame | undefined>(() => getGame(gameId));
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
   const [error, setError] = useState(false);
   const [cur, setCur] = useState(-1);
+  const [tab, setTab] = useState<Tab>('summary');
   const [copied, setCopied] = useState(false);
   const [orientation, setOrientation] = useState<'w' | 'b'>(game?.playerColor ?? 'w');
+  const [opening, setOpening] = useState<OpeningInfo | null>(null);
   const started = useRef(false);
 
   // Positions before/after each ply.
@@ -36,6 +43,15 @@ export default function AnalysisScreen({ gameId, onBack }: Props) {
     }
     return out;
   }, [game]);
+
+  useEffect(() => {
+    if (!game) return;
+    let active = true;
+    loadOpenings().then((db) => active && setOpening(identifyOpening(db, game.moves)));
+    return () => {
+      active = false;
+    };
+  }, [game?.id]);
 
   useEffect(() => {
     if (!game || game.analysis || started.current) return;
@@ -66,6 +82,11 @@ export default function AnalysisScreen({ gameId, onBack }: Props) {
     return () => window.removeEventListener('keydown', onKey);
   }, [positions.length]);
 
+  const summary = useMemo(
+    () => (game?.analysis ? summarizeGame(game.moves, game.analysis, opening, game.playerColor) : null),
+    [game, opening],
+  );
+
   if (!game) {
     return (
       <div className="page">
@@ -84,26 +105,10 @@ export default function AnalysisScreen({ gameId, onBack }: Props) {
   const evals: Score[] = analysis ? [...analysis.plies.map((p) => p.evalBefore), analysis.finalEval] : [];
   const grades: Grade[] = analysis ? analysis.plies.map((p) => p.grade) : [];
 
-  // Explanation for the selected ply.
-  let explanation = null;
+  const explanation = analysis && cur >= 0 ? explainPly(game, analysis, positions, cur) : null;
   let bestArrow: Arrow | null = null;
   if (analysis && cur >= 0) {
     const ply = analysis.plies[cur];
-    const fenBefore = positions[cur].fen;
-    const bestLine: PvLine = { multipv: 1, depth: 12, score: ply.bestScore, pv: ply.bestPv };
-    const next = analysis.plies[cur + 1];
-    const afterTurn = new Chess(positions[cur + 1].fen).turn();
-    const afterWhite = next ? next.evalBefore : analysis.finalEval;
-    const afterLine: PvLine | undefined = next
-      ? { multipv: 1, depth: 12, score: afterTurn === 'w' ? afterWhite : negateScore(afterWhite), pv: next.bestPv }
-      : undefined;
-    explanation = explainMove({
-      fen: fenBefore,
-      played: game.moves[cur],
-      bestLines: ply.bestPv.length ? [bestLine] : [],
-      afterLine,
-    });
-    if (explanation) explanation = { ...explanation, grade: ply.grade, headline: headlineFor(ply.grade, explanation.headline) };
     if (ply.bestUci && ply.bestUci !== game.moves[cur] && ply.grade !== 'best' && ply.grade !== 'good') {
       const { from, to } = parseUci(ply.bestUci);
       bestArrow = { from, to, color: '#22a35a', opacity: 0.85 };
@@ -146,6 +151,12 @@ export default function AnalysisScreen({ gameId, onBack }: Props) {
       if ((i % 2 === 0 ? 'w' : 'b') === color) out[p.grade] = (out[p.grade] ?? 0) + 1;
     });
     return out;
+  };
+
+  const jump = (ply: number) => {
+    setCur(ply);
+    setTab('moves');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
   return (
@@ -214,25 +225,64 @@ export default function AnalysisScreen({ gameId, onBack }: Props) {
               </div>
               <EvalGraph evals={evals} grades={grades} current={cur} onSelect={setCur} />
               <div className="eval-line muted small">
-                {cur >= -1 && evals[cur + 1] && (
+                {evals[cur + 1] && (
                   <>
                     {formatScore(evals[cur + 1])} · {describeAdvantage(evals[cur + 1])}
                   </>
                 )}
               </div>
+
+              <div className="tabs">
+                <button className={tab === 'summary' ? 'on' : ''} onClick={() => setTab('summary')}>
+                  สรุปเกม
+                </button>
+                <button className={tab === 'moves' ? 'on' : ''} onClick={() => setTab('moves')}>
+                  ทีละตา
+                </button>
+                <button className={tab === 'read' ? 'on' : ''} onClick={() => setTab('read')}>
+                  อ่านทั้งเกม
+                </button>
+              </div>
+
+              {tab === 'summary' && summary && (
+                <>
+                  <div className="card">
+                    <div className="card-title">สรุปสั้น ๆ</div>
+                    <ul className="reasons">
+                      {summary.short.map((t, i) => (
+                        <li key={i}>{t}</li>
+                      ))}
+                    </ul>
+                  </div>
+                  {summary.sections.map((sec, i) => (
+                    <SummaryBlock key={i} title={sec.title} items={sec.items} onJump={jump} startOpen={i < 2} />
+                  ))}
+                </>
+              )}
+
+              {tab === 'moves' && (
+                <>
+                  {cur === -1 && <div className="card muted">กด ▶ หรือแตะตาเดินเพื่อดูคำอธิบายทีละตา</div>}
+                  {explanation && (
+                    <DeepCard
+                      key={cur}
+                      title={`ตาที่ ${Math.floor(cur / 2) + 1}${cur % 2 === 0 ? ' (ขาว)' : ' (ดำ)'} ${positions[cur + 1].san}`}
+                      exp={explanation}
+                    />
+                  )}
+                  {cur >= 0 && analysis.plies[cur].bestPv.length > 1 && analysis.plies[cur].grade !== 'best' && (
+                    <div className="card small">
+                      <div className="sub-title">แนวการเดินที่ดีที่สุดจากตำแหน่งก่อนหน้า</div>
+                      <div>{pvText(positions[cur].fen, analysis.plies[cur].bestPv, 6)}</div>
+                    </div>
+                  )}
+                  <MoveList sans={positions.slice(1).map((p) => p.san)} grades={grades} current={cur} onSelect={setCur} />
+                </>
+              )}
+
+              {tab === 'read' && <ReadWholeGame game={game} analysis={analysis} positions={positions} onJump={jump} />}
             </>
           )}
-
-          {analysis && cur === -1 && <div className="card muted">กด ▶ หรือแตะตาเดินเพื่อดูคำอธิบายทีละตา</div>}
-          {explanation && <ExplanationCard title={`ตาที่ ${Math.floor(cur / 2) + 1}${cur % 2 === 0 ? '' : '...'} ${positions[cur + 1].san}`} exp={explanation} />}
-          {analysis && cur >= 0 && analysis.plies[cur].bestPv.length > 1 && analysis.plies[cur].grade !== 'best' && (
-            <div className="card small">
-              <div className="sub-title">แนวการเดินที่ดีที่สุดจากตำแหน่งก่อนหน้า</div>
-              <div>{pvText(positions[cur].fen, analysis.plies[cur].bestPv, 5)}</div>
-            </div>
-          )}
-
-          <MoveList sans={positions.slice(1).map((p) => p.san)} grades={grades} current={cur} onSelect={setCur} />
 
           <div className="controls">
             <button onClick={copyPgn}>{copied ? '✓ คัดลอกแล้ว' : '📋 คัดลอก PGN'}</button>
@@ -244,12 +294,133 @@ export default function AnalysisScreen({ gameId, onBack }: Props) {
   );
 }
 
-function negateScore(s: Score): Score {
-  return { type: s.type, value: -s.value };
+function explainPly(
+  game: SavedGame,
+  analysis: GameAnalysis,
+  positions: { fen: string; san: string }[],
+  i: number,
+): DeepExplanation | null {
+  const ply = analysis.plies[i];
+  const fenBefore = positions[i].fen;
+  const bestLine: PvLine = { multipv: 1, depth: 12, score: ply.bestScore, pv: ply.bestPv };
+  const next = analysis.plies[i + 1];
+  const afterTurn = new Chess(positions[i + 1].fen).turn();
+  const afterWhite = next ? next.evalBefore : analysis.finalEval;
+  const afterLine: PvLine | undefined = next
+    ? { multipv: 1, depth: 12, score: afterTurn === 'w' ? afterWhite : negateScore(afterWhite), pv: next.bestPv }
+    : undefined;
+  const mover = i % 2 === 0 ? 'w' : 'b';
+  const exp = deepExplain({
+    fen: fenBefore,
+    played: game.moves[i],
+    bestLines: ply.bestPv.length ? [bestLine] : [],
+    afterLine,
+    prev: i > 0 ? { fen: positions[i - 1].fen, uci: game.moves[i - 1] } : undefined,
+    neutral: game.playerColor !== mover,
+  });
+  if (!exp) return null;
+  // Use the grade from the full-game analysis so every screen agrees.
+  const rest = exp.headline.split(': ').slice(1).join(': ');
+  const fine = ply.grade === 'best' || ply.grade === 'good';
+  return {
+    ...exp,
+    grade: ply.grade,
+    headline: `${GRADE_ICON[ply.grade]} ${GRADE_LABEL[ply.grade]}: ${rest}`,
+    better: fine ? undefined : exp.better,
+    sections: fine ? exp.sections.filter((s) => !s.title.startsWith('ถ้าเดิน')) : exp.sections,
+  };
 }
 
-function headlineFor(grade: Grade, original: string): string {
-  // Replace the grade part of the headline with the analysis grade.
-  const rest = original.split(': ').slice(1).join(': ');
-  return `${GRADE_ICON[grade]} ${GRADE_LABEL[grade]}: ${rest}`;
+function SummaryBlock({
+  title,
+  items,
+  onJump,
+  startOpen,
+}: {
+  title: string;
+  items: { text: string; ply?: number }[];
+  onJump: (ply: number) => void;
+  startOpen: boolean;
+}) {
+  const [open, setOpen] = useState(startOpen);
+  const shown = open ? items : items.slice(0, 1);
+  return (
+    <div className="card">
+      <div className="card-title">{title}</div>
+      <ul className="reasons">
+        {shown.map((it, i) => (
+          <li
+            key={i}
+            className={it.ply !== undefined ? 'sum-item jump' : undefined}
+            onClick={it.ply !== undefined ? () => onJump(it.ply!) : undefined}
+          >
+            {it.text}
+          </li>
+        ))}
+      </ul>
+      {items.length > 1 && (
+        <button className="more-btn" onClick={() => setOpen((v) => !v)}>
+          {open ? 'ย่อ ▴' : `อ่านเพิ่ม (${items.length - 1}) ▾`}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function ReadWholeGame({
+  game,
+  analysis,
+  positions,
+  onJump,
+}: {
+  game: SavedGame;
+  analysis: GameAnalysis;
+  positions: { fen: string; san: string }[];
+  onJump: (ply: number) => void;
+}) {
+  const [openPly, setOpenPly] = useState<number | null>(null);
+  return (
+    <div className="card">
+      <div className="card-title">อ่านเกมทั้งหมดทีละตา</div>
+      <div className="muted small">แต่ละตามีคำอธิบายสั้น ๆ กด "อ่านเพิ่ม" เพื่อดูเหตุผลเต็ม การตอบโต้ และแนวการเดินล่วงหน้า</div>
+      {game.moves.map((uci, i) => {
+        const p = analysis.plies[i];
+        const r = tryMove(positions[i].fen, uci);
+        if (!r) return null;
+        const side = i % 2 === 0 ? 'ขาว' : 'ดำ';
+        const isYou = game.playerColor && game.playerColor === (i % 2 === 0 ? 'w' : 'b');
+        const prevMove = i > 0 ? tryMove(positions[i - 1].fen, game.moves[i - 1])?.move : undefined;
+        let shortText = `${describeMoveFromTo(r.move)} เพื่อ${moveReason(positions[i].fen, uci, prevMove)}`;
+        if (p.bestUci && p.bestUci !== uci && p.grade !== 'best' && p.grade !== 'good') {
+          const bm = tryMove(positions[i].fen, p.bestUci);
+          if (bm) shortText += ` · ควรเดิน ${describeMoveFromTo(bm.move)}`;
+        }
+        const open = openPly === i;
+        const deep = open ? explainPly(game, analysis, positions, i) : null;
+        return (
+          <div key={i} className="read-ply">
+            <div className="read-head">
+              <span className="sum-item jump" onClick={() => onJump(i)}>
+                {Math.floor(i / 2) + 1}
+                {i % 2 === 0 ? '.' : '...'} {positions[i + 1].san} ({side}
+                {isYou ? ' · คุณ' : ''})
+              </span>
+              <span className={`grade-${p.grade}`}>
+                {GRADE_ICON[p.grade]} {GRADE_LABEL[p.grade]}
+              </span>
+            </div>
+            <div className="summary-text">{shortText}</div>
+            {deep && <Sections sections={deep.sections} />}
+            <button className="more-btn" onClick={() => setOpenPly(open ? null : i)}>
+              {open ? 'ย่อ ▴' : 'อ่านเพิ่ม ▾'}
+            </button>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function negateScore(s: Score): Score {
+  return { type: s.type, value: -s.value };
 }
