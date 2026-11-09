@@ -42,6 +42,7 @@ interface Props {
 
 const SUGGEST_OPTS = { multipv: 3, depth: 15, movetime: 3000 };
 const AFTER_OPTS = { multipv: 1, depth: 13, movetime: 1500 };
+const AUTO_GUIDE_KEY = 'chess-guide.autoGuide';
 
 export default function GameScreen({ config, onExit, onAnalyse, onRestart }: Props) {
   const { mode, playerColor } = config;
@@ -55,6 +56,23 @@ export default function GameScreen({ config, onExit, onAnalyse, onRestart }: Pro
   const [lines, setLines] = useState<{ fen: string; lines: PvLine[] } | null>(null);
   const [explanations, setExplanations] = useState<Record<string, DeepExplanation>>({});
   const [hintFen, setHintFen] = useState<string | null>(null);
+  // Teaching: show suggestions every turn, or only when the user asks for this turn.
+  const [autoGuide, setAutoGuideState] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(AUTO_GUIDE_KEY) === '1';
+    } catch {
+      return false;
+    }
+  });
+  const [revealFen, setRevealFen] = useState<string | null>(null);
+  const setAutoGuide = (on: boolean) => {
+    setAutoGuideState(on);
+    try {
+      localStorage.setItem(AUTO_GUIDE_KEY, on ? '1' : '0');
+    } catch {
+      // Preference just isn't remembered.
+    }
+  };
   const [botThinking, setBotThinking] = useState(false);
   const [engineError, setEngineError] = useState(false);
   const [openingDb, setOpeningDb] = useState<Awaited<ReturnType<typeof loadOpenings>> | null>(null);
@@ -261,7 +279,9 @@ export default function GameScreen({ config, onExit, onAnalyse, onRestart }: Pro
   const currentLines = lines && lines.fen === fen ? lines.lines : null;
 
   const arrows: Arrow[] = [];
-  const showSuggestions = teaching && !ending && turn === playerColor;
+  const userTurn = teaching && !ending && turn === playerColor;
+  const guideVisible = autoGuide || revealFen === fen;
+  const showSuggestions = userTurn && guideVisible;
   const showHint = mode === 'bot' && !teaching && hintFen === fen && !ending;
   if ((showSuggestions || showHint) && currentLines) {
     const shown = showHint ? currentLines.slice(0, 1) : currentLines;
@@ -291,8 +311,10 @@ export default function GameScreen({ config, onExit, onAnalyse, onRestart }: Pro
   const userExplanation = userJustMoved ? explanations[lastPly.fenBefore + lastPly.uci] : undefined;
   const awaitingExplanation = userJustMoved && !userExplanation;
 
-  const opponentWarnings =
-    teaching && lastPly && turn === playerColor ? describeOpponentMove(lastPly.fenBefore, lastPly.uci, currentLines?.[0]) : [];
+  // With the guide hidden, keep threat warnings but don't give away a winning mate.
+  const opponentWarnings = (
+    teaching && lastPly && turn === playerColor ? describeOpponentMove(lastPly.fenBefore, lastPly.uci, currentLines?.[0]) : []
+  ).filter((w) => guideVisible || !w.startsWith('โอกาสทอง'));
 
   // Explanation of the user's previous move stays visible on their next turn.
   const prevUserPly = teaching && turn === playerColor && plies.length >= 2 ? plies[plies.length - 2] : undefined;
@@ -377,7 +399,21 @@ export default function GameScreen({ config, onExit, onAnalyse, onRestart }: Pro
                       )}
                     </div>
                   )}
-                  <Suggestions fen={fen} lines={currentLines} onPick={playMove} />
+                  {guideVisible ? (
+                    <Suggestions fen={fen} lines={currentLines} onPick={playMove} />
+                  ) : (
+                    <div className="card guide-off">
+                      <div className="card-title">ลองคิดเองก่อน 🤔</div>
+                      <div className="muted small">ไกด์ถูกซ่อนอยู่ ถ้าคิดไม่ออก กดปุ่มด้านล่างเพื่อดู 3 ทางเลือกและลูกศรบนกระดาน</div>
+                      <button className="primary" onClick={() => setRevealFen(fen)}>
+                        💡 เปิดไกด์ตานี้
+                      </button>
+                    </div>
+                  )}
+                  <label className="toggle-row">
+                    <input type="checkbox" checked={autoGuide} onChange={(e) => setAutoGuide(e.target.checked)} />
+                    <span>แสดงไกด์ทุกตาอัตโนมัติ</span>
+                  </label>
                   {prevExplanation && <DeepCard title="ตาที่แล้วของคุณ" exp={prevExplanation} />}
                   {notes.length > 0 && (
                     <Collapsible title="🧠 กลยุทธ์ตอนนี้" preview={notes[0]}>

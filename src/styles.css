@@ -809,3 +809,8 @@ details.card summary {
   width: 20px;
   height: 20px;
 }
+
+.guide-off button {
+  margin-top: 10px;
+  width: 100%;
+}
